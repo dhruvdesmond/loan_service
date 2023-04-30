@@ -1,0 +1,148 @@
+from typing import List
+
+from sqlalchemy import Column, String, Float, INTEGER, ForeignKey, func
+from sqlalchemy.orm import Session, relationship, contains_eager
+
+from data_adapter.db import LoanDBBase, DBBase
+from data_adapter.user import User
+from models.loan import LoanModel, RepaymentModel, LoanStatus, RepaymentStatus
+
+
+class Loan(DBBase, LoanDBBase):
+    __tablename__ = 'loan'
+
+    amount = Column(Float, nullable=False)
+    status = Column(String(20), nullable=False)
+    customer_id = Column(INTEGER, ForeignKey(User.id), nullable=False)
+    date = Column(String(20), nullable=False)
+    terms = Column(INTEGER, nullable=False)
+    #  relationship one to one with user
+    customer = relationship(User)
+
+    # relationship one to many with repayment
+    repayments = relationship('Repayment', backref='loan')
+
+    def __to_model(self) -> LoanModel:
+        """converts db orm object to pydantic model"""
+        self.date = self.date.strftime("%Y-%m-%d") if not isinstance(self.date, str) else self.date
+        return LoanModel.from_orm(self)
+
+    @classmethod
+    def create_loan(cls, loan) -> LoanModel:
+        from controller.context_manager import get_db_session
+        db: Session = get_db_session()
+        db.add(loan)
+        db.flush()
+        return loan.__to_model()
+
+    @classmethod
+    def get_by_id(cls, id) -> LoanModel:
+        loan = super().get_by_id(id)
+        return loan.__to_model() if loan else None
+
+    @classmethod
+    def get_by_uuid(cls, uuid) -> LoanModel:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+        loan = db.query(cls).filter(cls.uuid == uuid, cls.is_deleted.is_(False)).first()
+        return loan.__to_model() if loan else None
+
+    @classmethod
+    def get_active_loan_by_loan_uuid(cls, loan_uuid) -> LoanModel:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+        loan = db.query(cls).filter(cls.uuid == loan_uuid, cls.is_deleted.is_(False)).first()
+        return loan.__to_model() if loan else None
+
+    @classmethod
+    def get_all_customer_loans(cls, customer_id) -> List[LoanModel]:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+        loans = db.query(cls).join(Repayment).filter(cls.customer_id == customer_id, cls.is_deleted.is_(False)).all()
+        return [loan.__to_model() for loan in loans] if loans else []
+
+    @classmethod
+    def update_loan_by_uuid(cls, loan_uuid: str, update_dict: dict) -> int:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+
+        db.query(cls).filter(cls.uuid == loan_uuid,
+                             cls.is_deleted.is_(False)).update(update_dict)
+        db.flush()
+        return 0
+
+
+class Repayment(DBBase, LoanDBBase):
+    __tablename__ = 'repayment'
+
+    loan_id = Column(INTEGER, ForeignKey(Loan.id), nullable=False)
+    amount = Column(Float, nullable=False)
+    date = Column(String(20), nullable=False)
+    status = Column(String(20), nullable=False)
+
+    def __to_model(self) -> RepaymentModel:
+        """converts db orm object to pydantic model"""
+        self.date = self.date.strftime("%Y-%m-%d") if not isinstance(self.date, str) else self.date
+        return RepaymentModel.from_orm(self)
+
+    def get_model(self) -> RepaymentModel:
+        """converts db orm object to pydantic model"""
+        return self.__to_model()
+
+    @classmethod
+    def create_payments(cls, payments) -> List[RepaymentModel]:
+        from controller.context_manager import get_db_session
+        db: Session = get_db_session()
+        db.add_all(payments)
+        db.flush()
+        return [payment.__to_model() for payment in payments] if payments else None
+
+    @classmethod
+    def update_by_uuid(cls, uuid, update_dict: dict) -> int:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+        updates = db.query(cls).filter(cls.uuid == uuid, cls.is_deleted.is_(False)).update(update_dict)
+        db.flush()
+        return updates
+
+    @classmethod
+    def get_remaining_amount(cls, loan_id: int) -> float:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+
+        # Build the query to get the sum of the amounts of all pending repayments for the specified loan UUID
+        query = db.query(func.sum(cls.amount)).filter(cls.loan_id == loan_id, cls.status == RepaymentStatus.PENDING)
+
+        # Execute the query and return the result as a float
+        remaining_amount = query.scalar() or 0.0
+        return float(remaining_amount)
+
+    @classmethod
+    def update_repayment_status(cls, loan_id: int, amount: float) -> bool:
+        from controller.context_manager import get_db_session
+        db = get_db_session()
+
+        # Get all pending repayments for the specified loan UUID
+        pending_repayments = db.query(cls).filter(cls.loan_id == loan_id, cls.status == RepaymentStatus.PENDING).all()
+
+        if not pending_repayments:
+            # If there are no pending repayments, return False
+            return False
+
+        for repayment in pending_repayments:
+            if amount <= 0:
+                return amount == 0
+            if amount >= repayment.amount:
+                # If the payment amount is greater than or equal to the repayment amount,
+                # set the status to PAID and update the paid_amount
+                repayment.status = RepaymentStatus.PAID
+                amount -= repayment.amount
+            else:
+                repayment.amount = repayment.amount - amount
+                amount = 0
+
+        # Flush the changes to the database
+        db.flush()
+
+        # Return True if the payment amount has been fully applied to all pending repayments, False otherwise
+        return amount == 0
